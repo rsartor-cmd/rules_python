@@ -57,37 +57,84 @@ load("@rules_python//python/extensions:sdist.bzl", "py_sdist_library")
 # 3. BUILD RULE (Runs in Analysis & Execution Phases)
 # ==============================================================================
 def _py_sdist_library_impl(ctx):
-    # Declare the output directory tree that the build action will populate.
     site_packages = ctx.actions.declare_directory(ctx.label.name + "_site_packages")
-    # Find the root directory of the extracted sdist inside the action sandbox.
     sdist_root = ctx.files.srcs[0].owner.workspace_root or "."
-    # Register the build action (runs during the Execution Phase).
-    # Here we use `setup.py build_py` (or a copy/PEP-517 backend) to build the
-    # sdist source tree into the declared `site_packages` output directory.
+
+    # Get the hermetic Python interpreter from rules_python's toolchain
+    py_runtime = ctx.toolchains["@rules_python//python:toolchain_type"].py3_runtime
+    python_bin = py_runtime.interpreter.path
+
     ctx.actions.run_shell(
-        inputs = ctx.files.srcs,
+        inputs = depset(ctx.files.srcs, transitive = [py_runtime.files]),
         outputs = [site_packages],
         command = """
             set -euo pipefail
-            SDIST_ROOT="$1"
-            OUT_DIR="$(pwd)/$2"
+            PYTHON_BIN="$(pwd)/$1"
+            SDIST_ROOT="$2"
+            OUT_DIR="$(pwd)/$3"
             mkdir -p "$OUT_DIR"
-            # Run setup.py / build backend from the extracted sdist directory
-            # and emit the built runtime tree into $OUT_DIR:
-            (cd "$SDIST_ROOT" && python3 setup.py -q build_py --build-lib "$OUT_DIR")
+
+            cd "$SDIST_ROOT"
+            "$PYTHON_BIN" - "$OUT_DIR" << 'EOF'
+import importlib
+import os
+import sys
+import tempfile
+import zipfile
+
+out_dir = sys.argv[1]
+sys.path.insert(0, os.getcwd())
+
+# 1. Inspect pyproject.toml if present (PEP 517)
+backend_name = "setuptools.build_meta"
+if os.path.exists("pyproject.toml"):
+    import tomllib
+    with open("pyproject.toml", "rb") as f:
+        pyproject = tomllib.load(f)
+    backend_name = pyproject.get("build-system", {}).get(
+        "build-backend", "setuptools.build_meta"
+    )
+
+# 2. If using setuptools (via pyproject.toml, setup.cfg, or setup.py),
+#    we can build directly into `out_dir` without creating an intermediate wheel.
+if backend_name.startswith("setuptools"):
+    import setuptools
+    sys.argv = ["setup.py", "build", "--build-lib", out_dir]
+    if os.path.exists("setup.py"):
+        with open("setup.py", "rb") as f:
+             code = compile(f.read(), "setup.py", "exec")
+        exec(code, {"__name__": "__main__", "__file__": "setup.py"})
+    else:
+        # Handles pyproject.toml + setup.cfg when no setup.py file exists
+        setuptools.setup()
+else:
+    # 3. Generic PEP 517 fallback for non-setuptools backends (flit_core, hatchling, etc.)
+    mod_name, _, obj_path = backend_name.partition(":")
+    backend = importlib.import_module(mod_name)
+    if obj_path:
+        for attr in obj_path.split("."):
+            backend = getattr(backend, attr)
+    with tempfile.TemporaryDirectory() as tmp_whl_dir:
+        whl_name = backend.build_wheel(tmp_whl_dir)
+        with zipfile.ZipFile(os.path.join(tmp_whl_dir, whl_name)) as zf:
+            zf.extractall(out_dir)
+EOF
         """,
-        arguments = [sdist_root, site_packages.path],
+        arguments = [python_bin, sdist_root, site_packages.path],
         mnemonic = "PySdistBuild",
         progress_message = "Building Python sdist %{label}",
     )
-    # Compute the PYTHONPATH entry relative to the runfiles root:
-    # "<repo_name>/<package>/<site_packages_dir>"
-    rel_path = site_packages.short_path.removeprefix("../" + ctx.workspace_name + "/")
-    import_path = "{}/{}".format(ctx.workspace_name, rel_path)
+
+    if site_packages.short_path.startswith("../"):
+        import_path = site_packages.short_path.removeprefix("../")
+    else:
+        import_path = "{}/{}".format(ctx.workspace_name, site_packages.short_path)
+
     runfiles = ctx.runfiles(files = [site_packages]).merge_all([
         dep[DefaultInfo].default_runfiles
         for dep in ctx.attr.deps
     ])
+
     return [
         DefaultInfo(
             files = depset([site_packages]),
@@ -104,12 +151,14 @@ def _py_sdist_library_impl(ctx):
             ),
         ),
     ]
+
 py_sdist_library = rule(
     implementation = _py_sdist_library_impl,
     attrs = {
         "srcs": attr.label_list(allow_files = True, mandatory = True),
         "deps": attr.label_list(providers = [PyInfo]),
     },
+    toolchains = ["@rules_python//python:toolchain_type"],
 )
 # ==============================================================================
 # 2. REPOSITORY RULE (Runs in Fetch Phase)
