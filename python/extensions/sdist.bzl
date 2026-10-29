@@ -60,32 +60,42 @@ def _py_sdist_library_impl(ctx):
     site_packages = ctx.actions.declare_directory(ctx.label.name + "_site_packages")
     sdist_root = ctx.files.srcs[0].owner.workspace_root or "."
 
-    # Get the hermetic Python interpreter from rules_python's toolchain
     py_runtime = ctx.toolchains["@rules_python//python:toolchain_type"].py3_runtime
-    python_bin = py_runtime.interpreter.path
+    if py_runtime.interpreter:
+        # Hermetic toolchain (e.g. with --//python:use_hermetic_python=True)
+        python_bin = py_runtime.interpreter.path
+        is_hermetic = "1"
+        inputs = depset(ctx.files.srcs, transitive = [py_runtime.files])
+    else:
+        # System toolchain (protobuf's default @local_toolchains)
+        python_bin = py_runtime.interpreter_path
+        is_hermetic = "0"
+        inputs = depset(ctx.files.srcs)
 
     ctx.actions.run_shell(
-        inputs = depset(ctx.files.srcs, transitive = [py_runtime.files]),
+        inputs = inputs,
         outputs = [site_packages],
         command = """
             set -euo pipefail
-            PYTHON_BIN="$(pwd)/$1"
-            SDIST_ROOT="$2"
-            OUT_DIR="$(pwd)/$3"
+            if [ "$2" = "1" ]; then
+                PYTHON_BIN="$(pwd)/$1"
+            else
+                PYTHON_BIN="$1"
+            fi
+            SDIST_ROOT="$3"
+            OUT_DIR="$(pwd)/$4"
             mkdir -p "$OUT_DIR"
 
             cd "$SDIST_ROOT"
             "$PYTHON_BIN" - "$OUT_DIR" << 'EOF'
-import importlib
 import os
+import shutil
 import sys
-import tempfile
-import zipfile
 
 out_dir = sys.argv[1]
 sys.path.insert(0, os.getcwd())
 
-# 1. Inspect pyproject.toml if present (PEP 517)
+# 1. Inspect pyproject.toml if present
 backend_name = "setuptools.build_meta"
 if os.path.exists("pyproject.toml"):
     import tomllib
@@ -95,32 +105,27 @@ if os.path.exists("pyproject.toml"):
         "build-backend", "setuptools.build_meta"
     )
 
-# 2. If using setuptools (via pyproject.toml, setup.cfg, or setup.py),
-#    we can build directly into `out_dir` without creating an intermediate wheel.
-if backend_name.startswith("setuptools"):
-    import setuptools
+# 2. Try setuptools if available in this Python environment
+import setuptools
+if backend_name.startswith("setuptools") and hasattr(setuptools, "setup"):
     sys.argv = ["setup.py", "build", "--build-lib", out_dir]
     if os.path.exists("setup.py"):
         with open("setup.py", "rb") as f:
-             code = compile(f.read(), "setup.py", "exec")
+            code = compile(f.read(), "setup.py", "exec")
         exec(code, {"__name__": "__main__", "__file__": "setup.py"})
     else:
-        # Handles pyproject.toml + setup.cfg when no setup.py file exists
         setuptools.setup()
 else:
-    # 3. Generic PEP 517 fallback for non-setuptools backends (flit_core, hatchling, etc.)
-    mod_name, _, obj_path = backend_name.partition(":")
-    backend = importlib.import_module(mod_name)
-    if obj_path:
-        for attr in obj_path.split("."):
-            backend = getattr(backend, attr)
-    with tempfile.TemporaryDirectory() as tmp_whl_dir:
-        whl_name = backend.build_wheel(tmp_whl_dir)
-        with zipfile.ZipFile(os.path.join(tmp_whl_dir, whl_name)) as zf:
-            zf.extractall(out_dir)
+    # 3. Fallback when running on system Python without setuptools installed:
+    #    stage pure-Python packages from `src/` or the sdist root into `out_dir`.
+    search_root = "src" if os.path.isdir("src") else "."
+    for entry in os.listdir(search_root):
+        full_path = os.path.join(search_root, entry)
+        if os.path.isdir(full_path) and os.path.isfile(os.path.join(full_path, "__init__.py")):
+            shutil.copytree(full_path, os.path.join(out_dir, entry), dirs_exist_ok=True)
 EOF
         """,
-        arguments = [python_bin, sdist_root, site_packages.path],
+        arguments = [python_bin, is_hermetic, sdist_root, site_packages.path],
         mnemonic = "PySdistBuild",
         progress_message = "Building Python sdist %{label}",
     )
